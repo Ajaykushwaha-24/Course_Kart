@@ -1,7 +1,11 @@
 const nodemailer = require('nodemailer');
 
 const mailSender = async (email, title, body) => {
-    console.log(process.env.MAIL_USER);
+    if (!process.env.MAIL_HOST || !process.env.MAIL_USER || !process.env.MAIL_PASS) {
+        console.log(`Mail not configured - skipping email to ${email} - subject: ${title}`);
+        return { skipped: true };
+    }
+
     try {
         const transporter = nodemailer.createTransport({
             host: process.env.MAIL_HOST,
@@ -24,6 +28,7 @@ const mailSender = async (email, title, body) => {
     }
     catch (error) {
         console.log('Error while sending mail (mailSender) - ', email);
+        throw error;
     }
 }
 

@@ -1,44 +1,12 @@
-const mongoose = require("mongoose");
-require("dotenv").config();
+const supabase = require('./supabaseClient');
 
-exports.connectDB = () => {
-    mongoose.connect(process.env.MONGODB_URL, {
-        useNewUrlParser: true,
-        useUnifiedTopology:true,
-    })
-    .then(() => console.log("DB Connected Successfully"))
-    .catch( (error) => {
-        console.log("DB Connection Failed");
-        console.error(error);
-        process.exit(1);
-    } )
- };
-
-
-// const { MongoClient, ServerApiVersion } = require('mongodb');
-// const uri = ;
-
-// // Create a MongoClient with a MongoClientOptions object to set the Stable API version
-// exports.connectDB = () => {
-// const client = new MongoClient(uri, {
-//   serverApi: {
-//     version: ServerApiVersion.v1,
-//     strict: true,
-//     deprecationErrors: true,
-//   }
-// });
-
-// async function run() {
-//   try {
-//     // Connect the client to the server	(optional starting in v4.7)
-//     await client.connect();
-//     // Send a ping to confirm a successful connection
-//     await client.db("admin").command({ ping: 1 });
-//     console.log("Pinged your deployment. You successfully connected to MongoDB!");
-//   } finally {
-//     // Ensures that the client will close when you finish/error
-//     await client.close();
-//   }
-// }
-// run().catch(console.dir);
-// }
+exports.connectDB = async () => {
+    try {
+        const { error } = await supabase.from('users').select('id').limit(1);
+        if (error) throw error;
+        console.log("Supabase Connected Successfully");
+    } catch (error) {
+        console.log("Supabase Connection Check Failed - check SUPABASE_URL/SUPABASE_SERVICE_KEY and that schema.sql has been run");
+        console.error(error.message || error);
+    }
+};

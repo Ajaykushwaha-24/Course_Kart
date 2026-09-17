@@ -1,25 +1,24 @@
 // sendOtp , signup , login ,  changePassword
-const User = require('./../models/user');
-const Profile = require('./../models/profile');
+const supabase = require('../config/supabaseClient');
 const optGenerator = require('otp-generator');
-const OTP = require('../models/OTP')
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
-const cookie = require('cookie');
 const mailSender = require('../utils/mailSender');
 const otpTemplate = require('../mail/templates/emailVerificationTemplate');
 const { passwordUpdated } = require("../mail/templates/passwordUpdate");
+const { userToDTO } = require('../utils/transform');
 
 // ================ SEND-OTP For Email Verification ================
 exports.sendOTP = async (req, res) => {
     try {
 
-        // fetch email from re.body 
+        // fetch email from re.body
         const { email } = req.body;
 
         // check user already exist ?
-        const checkUserPresent = await User.findOne({ email });
+        const { data: checkUserPresent } = await supabase
+            .from('users').select('id').eq('email', email).maybeSingle();
 
         // if exist then response
         if (checkUserPresent) {
@@ -45,8 +44,8 @@ exports.sendOTP = async (req, res) => {
         await mailSender(email, 'OTP Verification Email', otpTemplate(otp, name));
 
         // create an entry for otp in DB
-        const otpBody = await OTP.create({ email, otp });
-        // console.log('otpBody - ', otpBody);
+        const { error: otpError } = await supabase.from('otps').insert({ email, otp });
+        if (otpError) throw otpError;
 
 
 
@@ -63,7 +62,7 @@ exports.sendOTP = async (req, res) => {
         res.status(200).json({
             success: false,
             message: 'Error while generating Otp',
-            error: error.mesage
+            error: error.message
         });
     }
 }
@@ -72,7 +71,7 @@ exports.sendOTP = async (req, res) => {
 // ================ SIGNUP ================
 exports.signup = async (req, res) => {
     try {
-        // extract data 
+        // extract data
         const { firstName, lastName, email, password, confirmPassword,
             accountType, contactNumber, otp } = req.body;
 
@@ -93,7 +92,8 @@ exports.signup = async (req, res) => {
         }
 
         // check user have registered already
-        const checkUserAlreadyExits = await User.findOne({ email });
+        const { data: checkUserAlreadyExits } = await supabase
+            .from('users').select('id').eq('email', email).maybeSingle();
 
         // if yes ,then say to login
         if (checkUserAlreadyExits) {
@@ -104,18 +104,17 @@ exports.signup = async (req, res) => {
         }
 
         // find most recent otp stored for user in DB
-        const recentOtp = await OTP.findOne({ email }).sort({ createdAt: -1 }).limit(1);
-        // console.log('recentOtp ', recentOtp)
+        const { data: recentOtpRows } = await supabase
+            .from('otps')
+            .select('*')
+            .eq('email', email)
+            .order('created_at', { ascending: false })
+            .limit(1);
 
-        // .sort({ createdAt: -1 }): 
-        // It's used to sort the results based on the createdAt field in descending order (-1 means descending). 
-        // This way, the most recently created OTP will be returned first.
-
-        // .limit(1): It limits the number of documents returned to 1. 
-
+        const recentOtp = recentOtpRows && recentOtpRows[0];
 
         // if otp not found
-        if (!recentOtp || recentOtp.length == 0) {
+        if (!recentOtp) {
             return res.status(400).json({
                 success: false,
                 message: 'Otp not found in DB, please try again'
@@ -132,20 +131,27 @@ exports.signup = async (req, res) => {
         let hashedPassword = await bcrypt.hash(password, 10);
 
         // additionDetails
-        const profileDetails = await Profile.create({
-            gender: null, dateOfBirth: null, about: null, contactNumber: null
-        });
+        const { data: profileDetails, error: profileError } = await supabase
+            .from('profiles')
+            .insert({ gender: null, date_of_birth: null, about: null, contact_number: null })
+            .select()
+            .single();
+        if (profileError) throw profileError;
 
-        let approved = "";
-        approved === "Instructor" ? (approved = false) : (approved = true);
+        let approved = accountType !== "Instructor";
 
         // create entry in DB
-        const userData = await User.create({
-            firstName, lastName, email, password: hashedPassword, contactNumber,
-            accountType: accountType, additionalDetails: profileDetails._id,
-            approved: approved,
+        const { error: userError } = await supabase.from('users').insert({
+            first_name: firstName,
+            last_name: lastName,
+            email,
+            password: hashedPassword,
+            account_type: accountType,
+            additional_details: profileDetails.id,
+            approved,
             image: `https://api.dicebear.com/5.x/initials/svg?seed=${firstName} ${lastName}`
         });
+        if (userError) throw userError;
 
         // return success message
         res.status(200).json({
@@ -180,7 +186,8 @@ exports.login = async (req, res) => {
         }
 
         // check user is registered and saved data in DB
-        let user = await User.findOne({ email }).populate('additionalDetails');
+        const { data: user } = await supabase
+            .from('users').select('*').eq('email', email).maybeSingle();
 
         if (!user) {
             return res.status(401).json({
@@ -194,18 +201,26 @@ exports.login = async (req, res) => {
         if (await bcrypt.compare(password, user.password)) {
             const payload = {
                 email: user.email,
-                id: user._id,
-                accountType: user.accountType // This will help to check whether user have access to route, while authorzation
+                id: user.id,
+                accountType: user.account_type // This will help to check whether user have access to route, while authorzation
             };
 
-            // Generate token 
+            // Generate token
             const token = jwt.sign(payload, process.env.JWT_SECRET, {
                 expiresIn: "24h",
             });
 
-            user = user.toObject();
-            user.token = token;
-            user.password = undefined; // we have remove password from object, not DB
+            // populate additionalDetails (profile)
+            let profileRow = null;
+            if (user.additional_details) {
+                const { data } = await supabase
+                    .from('profiles').select('*').eq('id', user.additional_details).maybeSingle();
+                profileRow = data;
+            }
+
+            const userDTO = userToDTO(user, profileRow);
+            userDTO.token = token;
+            delete userDTO.password; // never present on DTO anyway, kept for parity
 
 
             // cookie
@@ -216,7 +231,7 @@ exports.login = async (req, res) => {
 
             res.cookie('token', token, cookieOptions).status(200).json({
                 success: true,
-                user,
+                user: userDTO,
                 token,
                 message: 'User logged in successfully'
             });
@@ -257,7 +272,9 @@ exports.changePassword = async (req, res) => {
         }
 
         // get user
-        const userDetails = await User.findById(req.user.id);
+        const { data: userDetails, error: userFetchError } = await supabase
+            .from('users').select('*').eq('id', req.user.id).single();
+        if (userFetchError) throw userFetchError;
 
         // validate old passowrd entered correct or not
         const isPasswordMatch = await bcrypt.compare(
@@ -265,7 +282,7 @@ exports.changePassword = async (req, res) => {
             userDetails.password
         )
 
-        // if old password not match 
+        // if old password not match
         if (!isPasswordMatch) {
             return res.status(401).json({
                 success: false, message: "Old password is Incorrect"
@@ -285,9 +302,13 @@ exports.changePassword = async (req, res) => {
         const hashedPassword = await bcrypt.hash(newPassword, 10);
 
         // update in DB
-        const updatedUserDetails = await User.findByIdAndUpdate(req.user.id,
-            { password: hashedPassword },
-            { new: true });
+        const { data: updatedUserDetails, error: updateError } = await supabase
+            .from('users')
+            .update({ password: hashedPassword })
+            .eq('id', req.user.id)
+            .select()
+            .single();
+        if (updateError) throw updateError;
 
 
         // send email
@@ -297,7 +318,7 @@ exports.changePassword = async (req, res) => {
                 'Password for your account has been updated',
                 passwordUpdated(
                     updatedUserDetails.email,
-                    `Password updated successfully for ${updatedUserDetails.firstName} ${updatedUserDetails.lastName}`
+                    `Password updated successfully for ${updatedUserDetails.first_name} ${updatedUserDetails.last_name}`
                 )
             );
             // console.log("Email sent successfully:", emailResponse);

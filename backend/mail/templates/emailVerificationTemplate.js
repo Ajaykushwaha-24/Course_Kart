@@ -1,5 +1,3 @@
-const { eventNames } = require("../../models/section");
-
 const otpTemplate = (otp, name) => {
 	return `<!DOCTYPE html>
 	<html>

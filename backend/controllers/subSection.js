@@ -1,7 +1,19 @@
-const Section = require('../models/section');
-const SubSection = require('../models/subSection');
-const { uploadImageToCloudinary } = require('../utils/imageUploader');
+const supabase = require('../config/supabaseClient');
+const { uploadImageToCloudinary, deleteResourceFromCloudinary } = require('../utils/imageUploader');
+const { sectionToDTO } = require('../utils/transform');
 
+// Helper: fetch a section row + its ordered subsections and return the
+// same shape the old `.populate('subSection')` produced.
+async function getSectionWithSubSections(sectionId) {
+    const { data: sectionRow } = await supabase
+        .from('sections').select('*').eq('id', sectionId).maybeSingle();
+    if (!sectionRow) return null;
+
+    const { data: subSectionRows } = await supabase
+        .from('sub_sections').select('*').eq('section_id', sectionId).order('position', { ascending: true });
+
+    return sectionToDTO(sectionRow, subSectionRows || []);
+}
 
 
 // ================ create SubSection ================
@@ -12,7 +24,6 @@ exports.createSubSection = async (req, res) => {
 
         // extract video file
         const videoFile = req.files.video
-        // console.log('videoFile ', videoFile)
 
         // validation
         if (!title || !description || !videoFile || !sectionId) {
@@ -25,17 +36,25 @@ exports.createSubSection = async (req, res) => {
         // upload video to cloudinary
         const videoFileDetails = await uploadImageToCloudinary(videoFile, process.env.FOLDER_NAME);
 
-        // create entry in DB
-        const SubSectionDetails = await SubSection.create(
-            { title, timeDuration: videoFileDetails.duration, description, videoUrl: videoFileDetails.secure_url })
+        // find current max position for this section
+        const { data: existingSubSections } = await supabase
+            .from('sub_sections').select('position').eq('section_id', sectionId).order('position', { ascending: false }).limit(1);
+        const nextPosition = existingSubSections && existingSubSections.length > 0 ? existingSubSections[0].position + 1 : 0;
 
-        // link subsection id to section
-        // Update the corresponding section with the newly created sub-section
-        const updatedSection = await Section.findByIdAndUpdate(
-            { _id: sectionId },
-            { $push: { subSection: SubSectionDetails._id } },
-            { new: true }
-        ).populate("subSection")
+        // create entry in DB, linked to the section
+        const { error: createError } = await supabase
+            .from('sub_sections')
+            .insert({
+                title,
+                time_duration: videoFileDetails.duration,
+                description,
+                video_url: videoFileDetails.secure_url,
+                section_id: sectionId,
+                position: nextPosition,
+            });
+        if (createError) throw createError;
+
+        const updatedSection = await getSectionWithSubSections(sectionId);
 
         // return response
         res.status(200).json({
@@ -71,7 +90,8 @@ exports.updateSubSection = async (req, res) => {
         }
 
         // find in DB
-        const subSection = await SubSection.findById(subSectionId);
+        const { data: subSection } = await supabase
+            .from('sub_sections').select('*').eq('id', subSectionId).maybeSingle();
 
         if (!subSection) {
             return res.status(404).json({
@@ -81,26 +101,31 @@ exports.updateSubSection = async (req, res) => {
         }
 
         // add data
+        const fieldsToUpdate = {};
         if (title) {
-            subSection.title = title;
+            fieldsToUpdate.title = title;
         }
 
         if (description) {
-            subSection.description = description;
+            fieldsToUpdate.description = description;
         }
 
         // upload video to cloudinary
-        if (req.files && req.files.videoFile !== undefined) {
-            const video = req.files.videoFile;
+        if (req.files && req.files.video !== undefined) {
+            const video = req.files.video;
             const uploadDetails = await uploadImageToCloudinary(video, process.env.FOLDER_NAME);
-            subSection.videoUrl = uploadDetails.secure_url;
-            subSection.timeDuration = uploadDetails.duration;
+            fieldsToUpdate.video_url = uploadDetails.secure_url;
+            fieldsToUpdate.time_duration = uploadDetails.duration;
         }
 
         // save data to DB
-        await subSection.save();
+        if (Object.keys(fieldsToUpdate).length > 0) {
+            const { error: updateError } = await supabase
+                .from('sub_sections').update(fieldsToUpdate).eq('id', subSectionId);
+            if (updateError) throw updateError;
+        }
 
-        const updatedSection = await Section.findById(sectionId).populate("subSection")
+        const updatedSection = await getSectionWithSubSections(sectionId);
 
         return res.json({
             success: true,
@@ -125,17 +150,10 @@ exports.updateSubSection = async (req, res) => {
 exports.deleteSubSection = async (req, res) => {
     try {
         const { subSectionId, sectionId } = req.body
-        await Section.findByIdAndUpdate(
-            { _id: sectionId },
-            {
-                $pull: {
-                    subSection: subSectionId,
-                },
-            }
-        )
 
-        // delete from DB
-        const subSection = await SubSection.findByIdAndDelete({ _id: subSectionId })
+        // fetch subsection first so we have its video URL to delete from Cloudinary
+        const { data: subSection } = await supabase
+            .from('sub_sections').select('*').eq('id', subSectionId).maybeSingle();
 
         if (!subSection) {
             return res
@@ -143,10 +161,18 @@ exports.deleteSubSection = async (req, res) => {
                 .json({ success: false, message: "SubSection not found" })
         }
 
-        const updatedSection = await Section.findById(sectionId).populate('subSection')
+        if (subSection.video_url) {
+            await deleteResourceFromCloudinary(subSection.video_url) // delete course video From Cloudinary
+        }
+
+        // delete from DB
+        const { error: deleteError } = await supabase.from('sub_sections').delete().eq('id', subSectionId);
+        if (deleteError) throw deleteError;
+
+        const updatedSection = await getSectionWithSubSections(sectionId);
 
         // In frontned we have to take care - when subsection is deleted we are sending ,
-        // only section data not full course details as we do in others 
+        // only section data not full course details as we do in others
 
         // success response
         return res.json({

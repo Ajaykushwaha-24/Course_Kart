@@ -1,12 +1,55 @@
-const Course = require('../models/course');
-const Section = require('../models/section');
+const supabase = require('../config/supabaseClient');
+const { deleteResourceFromCloudinary } = require('../utils/imageUploader');
+const { sectionToDTO } = require('../utils/transform');
+
+// Helper: fetch a course with its ordered sections + subsections populated
+// (matches the old `.populate({path:'courseContent', populate:{path:'subSection'}})`)
+async function getCourseWithContent(courseId) {
+    const { data: courseRow } = await supabase
+        .from('courses').select('*').eq('id', courseId).maybeSingle();
+    if (!courseRow) return null;
+
+    const { data: sectionRows } = await supabase
+        .from('sections').select('*').eq('course_id', courseId).order('position', { ascending: true });
+
+    const sectionIds = (sectionRows || []).map((s) => s.id);
+    const { data: subSectionRows } = await supabase
+        .from('sub_sections')
+        .select('*')
+        .in('section_id', sectionIds.length ? sectionIds : ['00000000-0000-0000-0000-000000000000'])
+        .order('position', { ascending: true });
+
+    const subsBySection = {};
+    (subSectionRows || []).forEach((s) => {
+        if (!subsBySection[s.section_id]) subsBySection[s.section_id] = [];
+        subsBySection[s.section_id].push(s);
+    });
+
+    const courseContent = (sectionRows || []).map((sec) => sectionToDTO(sec, subsBySection[sec.id] || []));
+
+    return {
+        _id: courseRow.id,
+        courseName: courseRow.course_name,
+        courseDescription: courseRow.course_description,
+        instructor: courseRow.instructor,
+        whatYouWillLearn: courseRow.what_you_will_learn,
+        price: courseRow.price,
+        thumbnail: courseRow.thumbnail,
+        category: courseRow.category,
+        tag: courseRow.tag || [],
+        instructions: courseRow.instructions || [],
+        status: courseRow.status,
+        createdAt: courseRow.created_at,
+        updatedAt: courseRow.updated_at,
+        courseContent,
+    };
+}
 
 // ================ create Section ================
 exports.createSection = async (req, res) => {
     try {
-        // extract data 
+        // extract data
         const { sectionName, courseId } = req.body;
-        // console.log('sectionName, courseId = ', sectionName, ",  = ", courseId)
 
         // validation
         if (!sectionName || !courseId) {
@@ -16,29 +59,18 @@ exports.createSection = async (req, res) => {
             })
         }
 
-        // create entry in DB
-        const newSection = await Section.create({ sectionName });
+        // find current max position for this course
+        const { data: existingSections } = await supabase
+            .from('sections').select('position').eq('course_id', courseId).order('position', { ascending: false }).limit(1);
+        const nextPosition = existingSections && existingSections.length > 0 ? existingSections[0].position + 1 : 0;
 
-        // link - section id to current course 
-        const updatedCourse = await Course.findByIdAndUpdate(courseId,
-            {
-                $push: {
-                    courseContent: newSection._id
-                }
-            },
-            { new: true }
-        );
+        // create entry in DB, linked to the course
+        const { error: createError } = await supabase
+            .from('sections')
+            .insert({ section_name: sectionName, course_id: courseId, position: nextPosition });
+        if (createError) throw createError;
 
-        const updatedCourseDetails = await Course.findById(courseId)
-            .populate({
-                path: 'courseContent',
-                populate: {
-                    path: 'subSection'
-                }
-
-            })
-
-        // above -- populate remaining 
+        const updatedCourseDetails = await getCourseWithContent(courseId);
 
         res.status(200).json({
             success: true,
@@ -74,19 +106,15 @@ exports.updateSection = async (req, res) => {
         }
 
         // update section name in DB
-        await Section.findByIdAndUpdate(sectionId, { sectionName }, { new: true });
+        const { error: updateError } = await supabase
+            .from('sections').update({ section_name: sectionName }).eq('id', sectionId);
+        if (updateError) throw updateError;
 
-        const updatedCourseDetails = await Course.findById(courseId)
-            .populate({
-                path: 'courseContent',
-                populate: {
-                    path: 'subSection'
-                }
-            })
+        const updatedCourseDetails = await getCourseWithContent(courseId);
 
         res.status(200).json({
             success: true,
-            data:updatedCourseDetails,
+            data: updatedCourseDetails,
             message: 'Section updated successfully'
         });
     }
@@ -107,18 +135,22 @@ exports.updateSection = async (req, res) => {
 exports.deleteSection = async (req, res) => {
     try {
         const { sectionId, courseId } = req.body;
-        // console.log('sectionId = ', sectionId);
 
-        // delete section by id from DB
-        await Section.findByIdAndDelete(sectionId);
+        // delete this section's subsections' Cloudinary videos first, then
+        // let the DB cascade-delete the sub_sections rows when the section is removed
+        const { data: subSectionRows } = await supabase
+            .from('sub_sections').select('video_url').eq('section_id', sectionId);
+        for (const subSection of (subSectionRows || [])) {
+            if (subSection.video_url) {
+                await deleteResourceFromCloudinary(subSection.video_url)
+            }
+        }
 
-        const updatedCourseDetails = await Course.findById(courseId)
-            .populate({
-                path: 'courseContent',
-                populate: {
-                    path: 'subSection'
-                }
-            })
+        // delete section by id from DB (DB cascade removes its sub_sections)
+        const { error: deleteError } = await supabase.from('sections').delete().eq('id', sectionId);
+        if (deleteError) throw deleteError;
+
+        const updatedCourseDetails = await getCourseWithContent(courseId);
 
         res.status(200).json({
             success: true,
@@ -136,4 +168,3 @@ exports.deleteSection = async (req, res) => {
         })
     }
 }
-

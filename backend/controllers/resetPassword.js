@@ -1,4 +1,4 @@
-const User = require('../models/user');
+const supabase = require('../config/supabaseClient');
 const mailSender = require('../utils/mailSender');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
@@ -6,11 +6,12 @@ const bcrypt = require('bcrypt');
 // ================ resetPasswordToken ================
 exports.resetPasswordToken = async (req, res) => {
     try {
-        // extract email 
+        // extract email
         const { email } = req.body;
 
         // email validation
-        const user = await User.findOne({ email });
+        const { data: user } = await supabase
+            .from('users').select('id, email').eq('email', email).maybeSingle();
 
         if (!user) {
             return res.status(401).json({
@@ -23,14 +24,18 @@ exports.resetPasswordToken = async (req, res) => {
         const token = crypto.randomBytes(20).toString("hex");
 
         // update user by adding token & token expire date
-        const updatedUser = await User.findOneAndUpdate(
-            { email: email },
-            { token: token, resetPasswordTokenExpires: Date.now() + 5 * 60 * 1000 },
-            { new: true }); // by marking true, it will return updated user
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({
+                token,
+                reset_password_token_expires: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+            })
+            .eq('email', email);
+        if (updateError) throw updateError;
 
 
         // create url
-        const url = ``;
+        const url = `${process.env.FRONTEND_URL}/update-password/${token}`;
 
         // send email containing url
         await mailSender(email, 'Password Reset Link', `Password Reset Link : ${url}`);
@@ -82,9 +87,17 @@ exports.resetPassword = async (req, res) => {
 
 
         // find user by token from DB
-        const userDetails = await User.findOne({ token: token });
+        const { data: userDetails } = await supabase
+            .from('users').select('*').eq('token', token).maybeSingle();
 
-        // check ==> is this needed or not ==> for security  
+        if (!userDetails) {
+            return res.status(401).json({
+                success: false,
+                message: 'Password Reset token is invalid'
+            });
+        }
+
+        // check ==> is this needed or not ==> for security
         if (token !== userDetails.token) {
             return res.status(401).json({
                 success: false,
@@ -92,10 +105,8 @@ exports.resetPassword = async (req, res) => {
             });
         }
 
-        // console.log('userDetails.resetPasswordExpires = ', userDetails.resetPasswordExpires);
-
         // check token is expire or not
-        if (!(userDetails.resetPasswordTokenExpires > Date.now())) {
+        if (!(new Date(userDetails.reset_password_token_expires).getTime() > Date.now())) {
             return res.status(401).json({
                 success: false,
                 message: 'Token is expired, please regenerate token'
@@ -107,10 +118,11 @@ exports.resetPassword = async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
 
         // update user with New Password
-        await User.findOneAndUpdate(
-            { token },
-            { password: hashedPassword },
-            { new: true });
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({ password: hashedPassword })
+            .eq('token', token);
+        if (updateError) throw updateError;
 
         res.status(200).json({
             success: true,

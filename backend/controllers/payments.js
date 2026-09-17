@@ -3,14 +3,10 @@ const instance = require('../config/rajorpay');
 const crypto = require('crypto');
 const mailSender = require('../utils/mailSender');
 const { courseEnrollmentEmail } = require('../mail/templates/courseEnrollmentEmail');
+const { paymentSuccessEmail } = require('../mail/templates/paymentSuccessEmail');
 require('dotenv').config();
 
-const User = require('../models/user');
-const Course = require('../models/course');
-const CourseProgress = require("../models/courseProgress")
-
-
-const { default: mongoose } = require('mongoose')
+const supabase = require('../config/supabaseClient');
 
 
 // ================ capture the payment and Initiate the 'Rajorpay order' ================
@@ -34,14 +30,22 @@ exports.capturePayment = async (req, res) => {
         let course;
         try {
             // valid course Details
-            course = await Course.findById(course_id);
+            const { data: courseRow } = await supabase
+                .from('courses').select('*').eq('id', course_id).maybeSingle();
+            course = courseRow;
             if (!course) {
                 return res.status(404).json({ success: false, message: "Could not find the course" });
             }
 
-            // check user already enrolled the course
-            const uid = new mongoose.Types.ObjectId(userId);
-            if (course.studentsEnrolled.includes(uid)) {
+            // check user already enrolled the course (replaces the old
+            // course.studentsEnrolled.includes(uid) check)
+            const { data: existingEnrollment } = await supabase
+                .from('enrollments')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('course_id', course_id)
+                .maybeSingle();
+            if (existingEnrollment) {
                 return res.status(400).json({ success: false, message: "Student is already Enrolled" });
             }
 
@@ -58,10 +62,14 @@ exports.capturePayment = async (req, res) => {
     const options = {
         amount: totalAmount * 100,
         currency,
-        receipt: Math.random(Date.now()).toString(),
+        receipt: `receipt_${Date.now()}`,
     }
 
     // initiate payment using Rajorpay
+    if (!instance.instance) {
+        return res.status(503).json({ success: false, message: "Payments are not configured on this server" });
+    }
+
     try {
         const paymentResponse = await instance.instance.orders.create(options);
         // return response
@@ -72,7 +80,7 @@ exports.capturePayment = async (req, res) => {
     }
     catch (error) {
         console.log(error);
-        return res.status(500).json({ success: false, mesage: "Could not Initiate Order" });
+        return res.status(500).json({ success: false, message: "Could not Initiate Order" });
     }
 
 }
@@ -118,44 +126,36 @@ const enrollStudents = async (courses, userId, res) => {
 
     for (const courseId of courses) {
         try {
-            //find the course and enroll the student in it
-            const enrolledCourse = await Course.findOneAndUpdate(
-                { _id: courseId },
-                { $push: { studentsEnrolled: userId } },
-                { new: true },
-            )
+            //find the course
+            const { data: enrolledCourse } = await supabase
+                .from('courses').select('*').eq('id', courseId).maybeSingle();
 
             if (!enrolledCourse) {
                 return res.status(500).json({ success: false, message: "Course not Found" });
             }
-            // console.log("Updated course: ", enrolledCourse)
 
-            // Initialize course preogres with 0 percent
-            const courseProgress = await CourseProgress.create({
-                courseID: courseId,
-                userId: userId,
-                completedVideos: [],
-            })
+            // enroll the student in it - a single enrollments insert replaces
+            // both the old Course.studentsEnrolled $push AND the User.courses $push
+            const { error: enrollError } = await supabase
+                .from('enrollments')
+                .insert({ user_id: userId, course_id: courseId });
+            if (enrollError) throw enrollError;
 
-            // Find the student and add the course to their list of enrolled courses
-            const enrolledStudent = await User.findByIdAndUpdate(
-                userId,
-                {
-                    $push: {
-                        courses: courseId,
-                        courseProgress: courseProgress._id,
-                    },
-                },
-                { new: true }
-            )
+            // Initialize course progress with 0 percent
+            const { error: progressError } = await supabase
+                .from('course_progress')
+                .insert({ course_id: courseId, user_id: userId, completed_videos: [] });
+            if (progressError) throw progressError;
 
-            // console.log("Enrolled student: ", enrolledStudent)
+            // Find the student to send the enrollment email
+            const { data: enrolledStudent } = await supabase
+                .from('users').select('*').eq('id', userId).maybeSingle();
 
             // Send an email notification to the enrolled student
             const emailResponse = await mailSender(
                 enrolledStudent.email,
-                `Successfully Enrolled into ${enrolledCourse.courseName}`,
-                courseEnrollmentEmail(enrolledCourse.courseName, `${enrolledStudent.firstName}`)
+                `Successfully Enrolled into ${enrolledCourse.course_name}`,
+                courseEnrollmentEmail(enrolledCourse.course_name, `${enrolledStudent.first_name}`)
             )
             // console.log("Email Sent Successfully", emailResponse);
         }
@@ -180,11 +180,12 @@ exports.sendPaymentSuccessEmail = async (req, res) => {
 
     try {
         // find student
-        const enrolledStudent = await User.findById(userId);
+        const { data: enrolledStudent } = await supabase
+            .from('users').select('*').eq('id', userId).maybeSingle();
         await mailSender(
             enrolledStudent.email,
             `Payment Recieved`,
-            paymentSuccessEmail(`${enrolledStudent.firstName}`,
+            paymentSuccessEmail(`${enrolledStudent.first_name}`,
                 amount / 100, orderId, paymentId)
         )
     }
